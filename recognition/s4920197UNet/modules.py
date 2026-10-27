@@ -3,12 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PaperModel(nn.Module):
-    def __init__(self, in_channels, num_classes):
+    def __init__(self, num_classes):
         super().__init__()
         self.depth = 5
         #aim to extract 16 learned filters on the first pass over the data
         first_filters = 16
-        self.conv = nn.Conv2d(in_channels, first_filters, kernel_size=3, padding=1)
+        self.conv = nn.Conv2d(1, first_filters, kernel_size=3, padding=1)
         self.conv_last = nn.Sequential(
             nn.InstanceNorm2d(2*first_filters),
             nn.LeakyReLU(negative_slope=10e-2, inplace=True),
@@ -60,7 +60,6 @@ class PaperModel(nn.Module):
             ctx = self.context[i](x)
             x += ctx
 
-        print(x.shape)
         for i in range(self.depth - 1):
             #upsample -> concatonate with saved input from next level, then localize
             x = self.upsample[i](x)
@@ -131,3 +130,62 @@ class UpsamplingModule(nn.Module):
         x = self.activation(x)
         x = self.conv(x)
         return x 
+
+class BaselineModel(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        start = 64
+        self.depth = 5
+        self.block1 = nn.Sequential(
+            nn.Conv2d(1, start, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(start, start, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(start*2**(i-1),start*2**i, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(start*2**i,start*2**i,kernel_size=3, padding=1),
+                nn.ReLU() 
+            )
+            for i in range(1, self.depth)
+        ])
+
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.upblocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(start*2**i, start*2**(i-1), kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(start*2**(i-1), start*2**(i-1), kernel_size=3, padding=1),
+                nn.ReLU()
+            )
+            for i in reversed(range(1, self.depth))
+        ])
+
+        self.upconv = nn.ModuleList([
+            nn.ConvTranspose2d(start*2**i, start*2**(i-1), kernel_size=2, stride=2)
+            for i in reversed(range(1,self.depth))
+        ])
+
+        self.segment = nn.Conv2d(start, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        save = []
+        x = self.block1(x)
+        save.append(x)
+        for block in self.blocks:
+            save.append(x)
+            x = self.pool(x)
+            x = block(x)
+
+        for upconv, image, block in zip(self.upconv, reversed(save), self.upblocks):
+            x = upconv(x)
+            x = torch.cat((image, x), dim=1)
+            x = block(x)
+
+        x = self.segment(x)
+        x = torch.softmax(x, dim=1)
+
+        return x
