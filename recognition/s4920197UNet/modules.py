@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PaperModel(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes=6):
         super().__init__()
         self.depth = 5
         #aim to extract 16 learned filters on the first pass over the data
@@ -132,7 +132,7 @@ class UpsamplingModule(nn.Module):
         return x 
 
 class BaselineModel(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes=6):
         super().__init__()
         start = 64
         self.depth = 5
