@@ -1,6 +1,8 @@
 from dataset import TrainData, TestData, ValidationData
 from modules import BaselineModel, PaperModel
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
+import random
 import torch.nn as nn
 import torch
 import sys
@@ -37,26 +39,27 @@ class DiceLoss(nn.Module):
         return loss/NUM_CLASSES, dc
 
 class BasicUnet:
-    def __init__(self, device, data_path):
+    def __init__(self, device, data_path, smoke_t=False):
         self.inference = []
         self.vram_usage = []
         self.model = BaselineModel().to(device)
         self.dev = device
         self.data_path = data_path 
+        self.smoke_t = smoke_t
         
     def test_model(self):
         self.model.eval()
         testing = TestData(self.data_path)       
         test = DataLoader(
             dataset=testing,
-            batch_size=64,
+            batch_size= 2 if self.smoke_t else 128,
             shuffle=False,
             num_workers=6,
             pin_memory=True
         )
 
         with torch.no_grad():
-            total = self.test.__len__() 
+            total = testing.__len__() * 128 * 256
             correct = 0
 
             for masks, images in test:
@@ -66,12 +69,17 @@ class BasicUnet:
                 outputs = self.model(images)
                 classes = torch.argmax(outputs, dim=1)
                 one_hot = F.one_hot(classes, num_classes=6)
+                one_hot = one_hot.permute(0, 3, 1, 2)
                 correct += (one_hot == masks).sum().item()
+
+                if self.smoke_t:
+                    break
             
             accuracy = correct / total
+            print(f"accuracy: {accuracy}")
     
     def train_model(self):
-        test = TrainData(self.data_path)
+        training = TrainData(self.data_path)
         validation = ValidationData(self.data_path)
         device = self.dev
 
@@ -88,7 +96,7 @@ class BasicUnet:
             "decay": [0.0, 1e-5, 1e-4],
             "gamma": [1, 0.985, 0.970]
         }
-        
+
         hyperparameters_set = []
         for _ in range(15):
             while True:
@@ -119,7 +127,7 @@ class BasicUnet:
 
             train = DataLoader(
                 dataset=training,
-                batch_size=hyperparameters["batch"],
+                batch_size=hyperparameters["batch_size"],
                 shuffle=True,
                 num_workers=6,
                 pin_memory=True
@@ -129,48 +137,65 @@ class BasicUnet:
                 for i, (mask, image) in enumerate(train):
                     mask = mask.to(device)
                     image = image.to(device)
-                    t = time.time()
                     output = model(image)
                     loss, class_dice = loss_fn(mask, output)
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                    if self.smoke_t:
+                        break
                 sheduler.step()  
+                if self.smoke_t:
+                    break
             
             model.eval()
             correct = 0
             validate = DataLoader(
                 dataset=validation,
-                batch_size=32,
+                batch_size=2 if self.smoke_t else 32,
                 shuffle=False,
                 num_workers=6,
                 pin_memory=True
             )
 
-            for mask, image in validate: 
+            for masks, images in validate: 
                 masks = masks.to(self.dev)
                 images = images.to(self.dev)
 
                 outputs = model(images)
                 classes = torch.argmax(outputs, dim=1)
                 one_hot = F.one_hot(classes, num_classes=6)
+                one_hot = one_hot.permute(0, 3, 1, 2)
                 correct += (one_hot == masks).sum().item()
                 
                 tries -= 1
                 if best_model[1] < correct:
-                    best_model = (model, stats, correct)
+                    best_model = (model, correct)
                     tries = early_stop
                 elif tries == 0:
                     self.model = model
                     return
 
+                if self.smoke_t:
+                    break
+
         self.model = model
 
+    def save_model(self, path):
+        torch.save(self.model, path)
+    
+    def load_model(self, path):
+        self.model = torch.load(path, weights_only=False)
+
+    def use(self):
+        return self.model
+
 class ImprovedUnet: 
-    def __init__(self, device, data_path):
+    def __init__(self, device, data_path, smoke_t=False):
         self.model = PaperModel().to(device)
         self.dev = device
         self.data_path = data_path 
+        self.smoke_t = smoke_t
 
     #no validation function and test function for this model, as it is our basline that we compare with our basic model
     def train_model(self):
@@ -196,23 +221,30 @@ class ImprovedUnet:
             num_workers=6,
             pin_memory=True
         )
-
+        torch.autograd.set_detect_anomaly(True, check_nan=False)
         for epoch in range(300):
-            start = time.time()
+
             for i, (mask, image) in enumerate(train):
                 mask = mask.to(device)
                 image = image.to(device)
-                t = time.time()
                 output = self.model(image)
-                inference_time = time.time() - t
                 loss, class_dice = loss_fn(mask, output)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                if self.smoke_t:
+                    break
+
             sheduler.step()   
+            if self.smoke_t:
+                break
 
     def save_model(self, path):
-        torch.save(self.model.state_dict(), path)
+        print("SAVING MODEL")
+        torch.save(self.model, path)
     
     def load_model(self, path):
-        self.model.load_state_dict(path, weights_only=True)
+        self.model = torch.load(path, weights_only=False)
+    
+    def use(self):
+        return self.model

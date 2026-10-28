@@ -47,8 +47,8 @@ def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
 
 def load(folder, dir):
     data = []
-    seg = Path(f"{folder}/keras_slices_data/keras_slices_seg_{dir}")
-    img = Path(f"{folder}/keras_slices_data/keras_slices_{dir}")
+    seg = Path(f"{folder}/keras_slices_seg_{dir}")
+    img = Path(f"{folder}/keras_slices_{dir}")
     masks = sorted([f for f in seg.iterdir() if f.is_file()])
     images = sorted([f for f in img.iterdir() if f.is_file()])
     for mask, image in zip(masks, images):

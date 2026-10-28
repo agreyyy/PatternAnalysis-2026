@@ -49,7 +49,7 @@ class PaperModel(nn.Module):
         segments = []
         x = self.conv(x)
         ctx = self.context[0](x)
-        x += ctx
+        x = x + ctx
         for i in range(1, self.depth):
             #save all but last layer
             saved.append(x)
@@ -58,7 +58,7 @@ class PaperModel(nn.Module):
             #then save it to be used for upsampling
             x = self.aggregate[i - 1](x)
             ctx = self.context[i](x)
-            x += ctx
+            x = x + ctx
 
         for i in range(self.depth - 1):
             #upsample -> concatonate with saved input from next level, then localize
@@ -78,6 +78,7 @@ class ContextModule(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.norm = nn.InstanceNorm2d(channels)
+        self.norm2 = nn.InstanceNorm2d(channels)
         self.activation = nn.LeakyReLU(negative_slope=10e-2, inplace=True)
         self.basic_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.dropout = nn.Dropout(p=0.3)
@@ -90,7 +91,7 @@ class ContextModule(nn.Module):
         out = self.basic_conv(out)
         #drop nuerons, then normalize + activate
         out = self.dropout(out)
-        out = self.norm(out)
+        out = self.norm2(out)
         out = self.activation(out)
         #2nd convolution
         out = self.basic_conv(out)
