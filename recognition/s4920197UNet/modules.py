@@ -132,10 +132,9 @@ class UpsamplingModule(nn.Module):
         return x 
 
 class BaselineModel(nn.Module):
-    def __init__(self, num_classes=6):
+    def __init__(self, depth=5, start=64, num_classes=6):
         super().__init__()
-        start = 64
-        self.depth = 5
+        self.depth = depth
         self.block1 = nn.Sequential(
             nn.Conv2d(1, start, kernel_size=3, padding=1),
             nn.ReLU(),

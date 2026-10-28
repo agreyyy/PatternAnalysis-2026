@@ -14,7 +14,7 @@ print(out.shape)
 model = BaselineModel()
 model.train()
 out = model(input)
-print(out.shape)
+print(out)
 
 plt.imshow(img)
 plt.show()
