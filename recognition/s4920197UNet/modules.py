@@ -3,15 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PaperModel(nn.Module):
-    def __init__(self, num_classes=6):
+    def __init__(self):
         super().__init__()
+        num_classes = 6
         self.depth = 5
         #aim to extract 16 learned filters on the first pass over the data
         first_filters = 16
         self.conv = nn.Conv2d(1, first_filters, kernel_size=3, padding=1)
         self.conv_last = nn.Sequential(
             nn.InstanceNorm2d(2*first_filters),
-            nn.LeakyReLU(negative_slope=10e-2, inplace=True),
+            nn.LeakyReLU(negative_slope=1e-2, inplace=True),
             nn.Conv2d(2*first_filters, 2*first_filters, kernel_size=3, padding=1)
         )
 
@@ -24,7 +25,7 @@ class PaperModel(nn.Module):
             #conv2d{16, 32 -> 32, 64 -> ... 
             nn.Sequential(
                 nn.InstanceNorm2d(first_filters * 2**i),
-                nn.LeakyReLU(negative_slope=10e-2, inplace=True),
+                nn.LeakyReLU(negative_slope=1e-2, inplace=True),
                 nn.Conv2d(first_filters * 2**i, first_filters * 2**(i+1), kernel_size=3, padding=1, stride=2) 
             )
             for i in range(self.depth - 1)
@@ -38,11 +39,25 @@ class PaperModel(nn.Module):
             for i in range(self.depth - 1, 1, -1)
         ])
 
-        self.segment = nn.Sequential(
+        self.seg3 = nn.Sequential(
             nn.InstanceNorm2d(first_filters * 2),
-            nn.LeakyReLU(negative_slope=10e-2, inplace=True),
+            nn.LeakyReLU(negative_slope=1e-2, inplace=True),
             nn.Conv2d(first_filters * 2, num_classes, kernel_size=1)
         )
+
+        self.seg1 = nn.Sequential(
+            nn.InstanceNorm2d(64),
+            nn.LeakyReLU(negative_slope=1e-2, inplace=True),
+            nn.Conv2d(64, num_classes, kernel_size=1)
+        )
+
+        self.seg2 = nn.Sequential(
+            nn.InstanceNorm2d(32),
+            nn.LeakyReLU(negative_slope=1e-2, inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1)
+        )
+
+        self.scale = nn.Upsample(scale_factor=2.0, mode="bilinear")
 
     def forward(self, x):
         saved = []
@@ -67,9 +82,16 @@ class PaperModel(nn.Module):
             if i != 3:
                 #last level, no need to localise
                 x = self.localise[i](x)
+            if 1 == i or i == 2:
+                segments.append(x)
         
+        #upsample and add lower segmentation maps
+        s1 = self.seg1(segments[0])
+        seg = self.scale(s1) + self.seg2(segments[1])
+        seg = self.scale(seg)
         x = self.conv_last(x)
-        x = self.segment(x)
+        # sum of segments from 3 layers below last
+        x = self.seg3(x) + seg
         x = torch.softmax(x, dim=1)
 
         return x
@@ -79,8 +101,9 @@ class ContextModule(nn.Module):
         super().__init__()
         self.norm = nn.InstanceNorm2d(channels)
         self.norm2 = nn.InstanceNorm2d(channels)
-        self.activation = nn.LeakyReLU(negative_slope=10e-2, inplace=True)
-        self.basic_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.activation = nn.LeakyReLU(negative_slope=1e-2, inplace=True)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.dropout = nn.Dropout(p=0.3)
     
     def forward(self, x):
@@ -88,13 +111,13 @@ class ContextModule(nn.Module):
         out = self.norm(x)
         out = self.activation(out)
         #first convolution
-        out = self.basic_conv(out)
+        out = self.conv1(out)
         #drop nuerons, then normalize + activate
         out = self.dropout(out)
         out = self.norm2(out)
         out = self.activation(out)
         #2nd convolution
-        out = self.basic_conv(out)
+        out = self.conv2(out)
         return out
 
 #localization halves the channel number
@@ -103,7 +126,7 @@ class LocalizationModule(nn.Module):
         super().__init__()
         self.norm = nn.InstanceNorm2d(channels)
         self.norm2 = nn.InstanceNorm2d(channels)
-        self.activation = nn.LeakyReLU(negative_slope=10e-2, inplace=True)
+        self.activation = nn.LeakyReLU(negative_slope=1e-2, inplace=True)
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.segment_conv = nn.Conv2d(channels, channels//2, kernel_size=1)
 
@@ -122,7 +145,7 @@ class UpsamplingModule(nn.Module):
         super().__init__()
         self.scale = nn.Upsample(scale_factor=2.0, mode="nearest")
         self.norm = nn.InstanceNorm2d(channels)
-        self.activation = nn.LeakyReLU(negative_slope=10e-2, inplace=True)
+        self.activation = nn.LeakyReLU(negative_slope=1e-2, inplace=True)
         self.conv = nn.Conv2d(channels, channels//2, kernel_size=3, padding=1)
     
     def forward(self, x):
@@ -133,8 +156,9 @@ class UpsamplingModule(nn.Module):
         return x 
 
 class BaselineModel(nn.Module):
-    def __init__(self, depth=5, start=64, num_classes=6):
+    def __init__(self, depth=5, start=64):
         super().__init__()
+        num_classes = 6
         self.depth = depth
         self.block1 = nn.Sequential(
             nn.Conv2d(1, start, kernel_size=3, padding=1),

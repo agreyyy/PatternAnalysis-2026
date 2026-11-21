@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 import torch
 NUM_CLASSES = 6
 
+'''The class that loads testing data (default split)'''
 class TestData(Dataset):
     def __init__(self, folder):
         self.test = load(folder, "test")
@@ -17,6 +18,7 @@ class TestData(Dataset):
     def __getitem__(self, idx):
         return get_data(self.test[idx])
 
+'''The class that loads training data (default split)'''
 class TrainData(Dataset):
     def __init__(self, folder):
         self.train = load(folder, "train")
@@ -27,6 +29,7 @@ class TrainData(Dataset):
     def __getitem__(self, idx):
         return get_data(self.train[idx])
 
+'''The class that loads validation data (default split)'''
 class ValidationData(Dataset):
     def __init__(self, folder):
         self.validate = load(folder, "validate")
@@ -45,6 +48,7 @@ def to_channels(arr: np.ndarray, dtype=np.uint8) -> np.ndarray:
         res[c, arr == c] = 1
     return res
 
+'''The data is split up by patients by default, this function just takes the truth maps and images and pairs them together, loading them into the nifti format'''
 def load(folder, dir):
     data = []
     seg = Path(f"{folder}/keras_slices_seg_{dir}")

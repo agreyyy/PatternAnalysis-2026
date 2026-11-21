@@ -1,5 +1,6 @@
 from dataset import TrainData, TestData, ValidationData
 from modules import BaselineModel, PaperModel
+from metrics import DiceLoss
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import random
@@ -7,89 +8,22 @@ import torch.nn as nn
 import torch
 import sys
 import time
+import copy
+import heapq
+import json
+import matplotlib.pyplot as plt
 
-class DiceLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, mask, output):
-        loss = 0.0
-        epsilon = 1e-6
-        dc = []
-        for k in range(6):
-            p = output[:, k, :, :]
-            y = mask[:, k, :, :]
-
-            p_flat = p.contiguous().view(-1)
-            y_flat = y.contiguous().view(-1)
-            intersection = torch.sum(p_flat * y_flat)
-            total = torch.sum(p_flat) + torch.sum(y_flat)
-
-            dice_coef = (2.0 * intersection + epsilon) / (total + epsilon)
-            dc.append(dice_coef)
-            loss += (1.0 - dice_coef)
-
-        return loss/6, dc
-
+'''The class that allows training of a basic Unet network that plots its peak VRAM and loss over time 
+during training. Allows for saving and loading models, and tunes hyperparameters 
+with random search over 12 possible sets'''
 class BasicUnet:
-    def __init__(self, device, data_path, smoke_t=False):
-        self.inference = []
-        self.vram_usage = []
-        self.model = BaselineModel().to(device)
-        self.dev = device
+    def __init__(self, data_path, smoke_t=False):
+        self.data_vram = []
+        self.data_loss = []
+        self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = BaselineModel().to(self.dev)
         self.data_path = data_path 
         self.smoke_t = smoke_t
-        
-    def test_model(self):
-        self.model.eval()
-        testing = TestData(self.data_path)       
-        test = DataLoader(
-            dataset=testing,
-            batch_size= 1,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
-
-        dice_scores = [0,0,0,0,0,0]
-        with torch.no_grad():
-            total = testing.__len__() * 128 * 256
-            correct = 0
-            ni = 0
-            start = time.time()
-            for masks, images in test:
-                ni += 1
-                masks = masks.to(self.dev)
-                images = images.to(self.dev)
-                outputs = self.model(images)
-                epsilon = 1e-6
-                
-                for k in range(6):
-                    p = outputs[:, k, :, :]
-                    y = masks[:, k, :, :]
-
-                    p_flat = p.contiguous().view(-1)
-                    y_flat = y.contiguous().view(-1)
-                    intersection = torch.sum(p_flat * y_flat)
-                    correct += intersection
-                    total = torch.sum(p_flat) + torch.sum(y_flat)
-
-                    dice_scores[k] += (2.0 * intersection + epsilon) / (total + epsilon)
-
-                if self.smoke_t:
-                    break
-            
-            accuracy = correct / total
-            start = time.time() - start
-            start /= ni
-            for d in dice_scores: 
-                d /= ni
-
-            iou = sum(dice_scores)/6 / (2 - sum(dice_scores)/6)
-            print(f"average inference time: {start}")
-            print(f"dice scores prer class: \n{dice_scores}")
-            accuracy = correct / total
-            print(f"average IoU score: {iou}")
 
     def train_model(self):
         training = TrainData(self.data_path)
@@ -100,6 +34,7 @@ class BasicUnet:
         loss_fn = DiceLoss()
         early_stop = 4
         tries = early_stop
+
 
         sample_space = {
             "lr": [5e-4, 1e-3],
@@ -120,13 +55,14 @@ class BasicUnet:
                 if parameters not in hyperparameters_set:
                     hyperparameters_set.append(parameters)
                     break
-        i = 0
+
         for hyperparameters in hyperparameters_set:
-            print(f"starte training on hyperparametes set {i}\n{hyperparameters}")
+            data_loss = []
+            data_vram = []
+            print(f"started training on hyperparametes set: \n{hyperparameters}")
             model = BaselineModel(
                 hyperparameters["depth"], 
                 hyperparameters["filters"], 
-                num_classes=6
             ).to(self.dev).train()
 
             optimizer = torch.optim.Adam(
@@ -144,34 +80,36 @@ class BasicUnet:
                 dataset=training,
                 batch_size=hyperparameters["batch_size"],
                 shuffle=True,
-                num_workers=4,
             )
 
-            for epoch in range(hyperparameters["epochs"]):
+            N = 1 if self.smoke_t else hyperparameters['epochs']
+            t = time.time()
+            for epoch in range(N):
                 print(f"starting epoch {epoch}")
-                for mask, image in train:
+                for i, (mask, image) in enumerate(train):
                     mask = mask.to(device)
                     image = image.to(device)
                     output = model(image)
-                    loss, class_dice = loss_fn(mask, output)
-                    if i % 30 == 0:
-                        print(f"{i}: loss = {loss}")
+                    loss, _class_dice = loss_fn(mask, output)
+                    if i % 25 == 0:
+                        data_loss.append(loss.item())
+                        if torch.cuda.is_available():
+                            vram = torch.cuda.memory_allocated()
+                            data_vram.append(vram)
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
                     if self.smoke_t:
                         break
+
                 sheduler.step()  
-                if self.smoke_t:
-                    break
             
             model.eval()
             correct = 0
             validate = DataLoader(
                 dataset=validation,
-                batch_size=2 if self.smoke_t else 32,
+                batch_size=1 if self.smoke_t else 32,
                 shuffle=False,
-                num_workers=4,
             )
 
             for masks, images in validate: 
@@ -188,83 +126,48 @@ class BasicUnet:
                     
             tries -= 1
             if best_model[1] < correct:
-                best_model = (model.deepcopy(), correct)
-                tries = early_stop
-            elif tries == 0:
+                best_model = (copy.deepcopy(model), correct)
                 self.model = model
-                return
+                self.data_vram = data_vram
+                self.data_loss = data_loss
+                self.save_model()
+                tries = early_stop
+                taken = time.time() - t
+                print(f"training finished in {taken}s")
+                with open("unet/time.json", "w") as f:
+                    json.dump(taken, f)
+            elif tries == 0:
+                break
+            if self.smoke_t:
+                break
+        
+        self.model = best_model[0]
 
-        self.model = model
-
-    def save_model(self, path):
-        torch.save(self.model, path)
+    def save_model(self):
+        torch.save(self.model, 'unet/model.pt')
+        with open('unet/loss.json', 'w') as f:
+            json.dump(self.data_loss, f)
+        with open('unet/vram.json','w') as f:
+            json.dump(self.data_vram, f)
     
     def load_model(self, path):
-        self.model = torch.load(path, weights_only=False)
+        self.model = torch.load(path, weights_only=False, map_location=self.dev)
 
-    def use(self):
-        return self.model
-
+'''An implementation of the improved Unet, 
+this class can load a pretrained model or train one and save it by itself. All training parameters
+match the parameters used in the paper and training metrics like VRAM use and loss over time, training time are saved as figures'''
 class ImprovedUnet: 
-    def __init__(self, device, data_path, smoke_t=False):
-        self.model = PaperModel().to(device)
-        self.dev = device
+    def __init__(self, data_path, smoke_t=False):
+        self.dev = torch.device("cuda" if torch.cuda.is_available() else 'cpu')
+        self.model = PaperModel().to(self.dev)
         self.data_path = data_path 
+        self.data_vram = []
+        self.data_loss = []
         self.smoke_t = smoke_t
-
-    def test_model(self):
-        self.model.eval()
-        testing = TestData(self.data_path)       
-        test = DataLoader(
-            dataset=testing,
-            batch_size= 1,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
-
-        dice_scores = [0,0,0,0,0,0]
-        with torch.no_grad():
-            total = testing.__len__() * 128 * 256
-            correct = 0
-            ni = 0
-            start = time.time()
-            for masks, images in test:
-                ni += 1
-                masks = masks.to(self.dev)
-                images = images.to(self.dev)
-                outputs = self.model(images)
-                epsilon = 1e-6
-                
-                for k in range(6):
-                    p = outputs[:, k, :, :]
-                    y = masks[:, k, :, :]
-
-                    p_flat = p.contiguous().view(-1)
-                    y_flat = y.contiguous().view(-1)
-                    intersection = torch.sum(p_flat * y_flat)
-                    correct += intersection
-                    total = torch.sum(p_flat) + torch.sum(y_flat)
-
-                    dice_scores[k] += (2.0 * intersection + epsilon) / (total + epsilon)
-
-                if self.smoke_t:
-                    break
-            
-            accuracy = correct / total
-            start = time.time() - start
-            start /= ni
-            for d in dice_scores: 
-                d /= ni
-
-            iou = sum(dice_scores)/6 / (2 - sum(dice_scores)/6)
-            print(f"average inference time: {start}")
-            print(f"dice scores prer class: \n{dice_scores}")
-            accuracy = correct / total
-            print(f"average IoU score: {iou}")
 
     #no validation function and test function for this model, as it is our basline that we compare with our basic model
     def train_model(self):
+        t = time.time()
         self.model.train()
         device = self.dev
         optimizer = torch.optim.Adam(
@@ -284,42 +187,197 @@ class ImprovedUnet:
             dataset=training,
             batch_size=2,
             shuffle=True,
-            num_workers=4,
         )
 
-        for epoch in range(2):
+        N = 1 if self.smoke_t else 45
+        data_loss = []
+        data_vram = []
+        for epoch in range(N):
             print(f"starting epoch {epoch}")
             for i, (mask, image) in enumerate(train):
                 mask = mask.to(device)
                 image = image.to(device)
                 output = self.model(image)
                 loss, class_dice = loss_fn(mask, output)
-                if i % 30 == 0:
-                    print(f"{i}: loss = {loss}")
+                if i % 25 == 0:
+                    data_loss.append(loss.item())
+                    if torch.cuda.is_available():
+                        data_vram.append(torch.cuda.memory_allocated())
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                if self.smoke_t:
+
+                if self.smoke_t: 
                     break
 
             sheduler.step()   
-            if self.smoke_t:
-                break
 
-    def save_model(self, path):
-        torch.save(self.model, path)
-    
-    def load_model(self, path):
-        self.model = torch.load(path, weights_only=False)
-    
-    def use(self):
-        return self.model
+        with open("iunet/loss.json", "w") as f:
+            json.dump(data_loss, f)
 
-    def save_model(self, path):
-        torch.save(self.model, path)
+        with open("iunet/vram.json", "w") as f:
+            json.dump(data_vram, f)
+
+        t = time.time() - t
+        print(f"training finished in {t}s")
+        with open("iunet/time.json", "w") as f:
+            json.dump(t, f)
+        self.save_model()
+
+    def save_model(self):
+        torch.save(self.model, 'iunet/model.pt')
     
     def load_model(self, path):
         self.model = torch.load(path, weights_only=False, map_location=self.dev)
-    
-    def use(self):
-        return self.model
+
+'''
+Given a model (Unet or Improved Unet), calculates the per class Iou and Dice scores,
+displays them together with the average inference time, and returns the images which produce
+the lowest prostate dice scores 
+'''
+def test_model(model, data, smoke=False):
+    model.eval()
+    test = DataLoader(
+        dataset=data,
+        batch_size= 1,
+        shuffle=False,
+    )
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    lowest_three = [(999, None), (999, None), (999, None)]
+    total_intersect = torch.zeros(6, dtype=torch.float64, device=dev)
+    total_denom = torch.zeros(6, dtype=torch.float64, device=dev)
+    total_union = torch.zeros(6, dtype=torch.float64, device=dev)
+
+    with torch.no_grad():
+        total = data.__len__() * 128 * 256
+        correct = 0
+        ni = 0
+        start = time.time()
+        for mask, image in test:
+            ni += 1
+            mask = mask.to(dev).bool()
+            image = image.to(dev)
+            output = model(image)
+            output = torch.argmax(output, dim=1)
+            out_prostate = (output == 5)
+            mask_prostate = mask[:, 5].bool()
+            output = F.one_hot(output, num_classes=6).movedim(-1,1).bool()
+            intersect = (output & mask).sum(dim=(0,2,3)).float()
+            denom = output.sum(dim=(0,2,3)).float() + mask.sum(dim=(0,2,3)).float()
+            union = (output | mask).sum(dim=(0,2,3)).float()
+
+            total_intersect += intersect
+            total_denom += denom
+            total_union += union
+
+            if denom[5] == 0:
+                continue
+
+            score = 2 * intersect[5] / denom[5]
+            el = (score, (image, output, mask))
+            if score < lowest_three[0][0]:
+                lowest_three.insert(0, el)
+                lowest_three.pop()
+            elif score < lowest_three[1][0]:
+                lowest_three.insert(1, el)
+                lowest_three.pop()
+            elif score < lowest_three[2][0]:
+                lowest_three.pop()
+                lowest_three.append(el)
+
+            if smoke:
+                break
+        
+        start = time.time() - start
+        start /= ni
+        print(f"average inference time: {start}")
+
+        dice_scores = torch.where(
+            total_denom > 0, 
+            2 * total_intersect / total_denom,
+            torch.tensor(float('nan'), dtype=torch.float64, device=dev)
+        )
+        mean_dice = dice_scores
+        print(f"dice scores per class: {mean_dice}")
+
+        iou = torch.where(
+            total_union > 0,
+            total_intersect / total_union,
+            torch.tensor(float('nan'), dtype=torch.float64, device=dev)
+        )
+
+        mean_iou = iou
+        print(f"average per class IoU score: {mean_iou}")
+        #returns the worst 3 images
+        return lowest_three
+
+# actually trains the model and plots the training curves    
+if __name__ == "__main__":    
+    wd = sys.argv[1]
+    print(wd)
+    data = f"{wd}/keras_slices_data"
+    unet = BasicUnet(data)
+    unet.train_model()
+    # unet.load_model("unet/unet.pt")
+    np = sum(p.numel() for p in unet.model.parameters())
+    print(f"Unet parameter count: {np}")
+
+    with open("unet/time.json", 'r') as f:
+        data = json.load(f)
+        print(f"training took {data/60} minutes")
+
+    with open('unet/loss.json', 'r') as f:
+        data = json.load(f)
+        x = [25 * i for i in range(len(data))]
+        plt.figure(figsize=(10,10))
+        plt.title("Basic Unet training loss over time")
+        plt.xlabel("iterations")
+        plt.ylabel("loss")
+        plt.plot(x, data, color='b')
+        plt.grid(True)
+        plt.savefig("visuals/unet_loss.png")
+
+    with open('unet/vram.json', 'r') as f:
+        data = json.load(f)
+        x = [25 * i for i in range(len(data))]
+        y = [d / (1024 ** 3) for d in data]
+        plt.figure(figsize=(10,10))
+        plt.title("Basic Unet VRAM usage over time")
+        plt.xlabel("iterations")
+        plt.ylabel("VRAM (GB)")
+        plt.plot(x, y, color='b')
+        plt.grid(True)
+        plt.savefig("visuals/unet_vram.png")
+
+    improved_unet = ImprovedUnet(data)
+    improved_unet.train_model()
+    # improved_unet.load_model("iunet/improved-model.pt")
+    np = sum(p.numel() for p in improved_unet.model.parameters())
+    print(f"Improved Unet parameter count: {np}")
+    with open("iunet/time.json", 'r') as f:
+        data = json.load(f)
+        print(f"training took {data/60} minutes")
+
+    with open('iunet/loss.json', 'r') as f:
+        data = json.load(f)
+        x = [25 * i for i in range(len(data))]
+        plt.figure(figsize=(10,10))
+        plt.title("Improved Unet training loss over time")
+        plt.xlabel("iterations")
+        plt.ylabel("loss")
+        plt.plot(x, data, color='b')
+        plt.grid(True)
+        plt.savefig("visuals/iunet_loss.png")
+
+    with open('iunet/vram.json', 'r') as f:
+        data = json.load(f)
+        x = [25 * i for i in range(len(data))]
+        y = [d / (1024 ** 3) for d in data]
+        plt.figure(figsize=(10,10))
+        plt.title("Improved Unet VRAM usage over time")
+        plt.xlabel("iterations")
+        plt.ylabel("VRAM (GB)")
+        plt.plot(x, y, color='b')
+        plt.grid(True)
+        plt.savefig("visuals/iunet_vram.png")

@@ -7,9 +7,10 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
 
-load = sys.argv[-1] == 'load'
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-data = "/home/andrey/Documents/comp3710/project/keras_slices_data"
+wd = sys.argv[1]
+print(wd)
+data = f"{wd}/keras_slices_data"
 train = TrainData(data)
 dl = DataLoader(
     dataset = train,
@@ -17,14 +18,9 @@ dl = DataLoader(
     shuffle = True
 )
 
-unet = BasicUnet(dev, data, True)
-if load:
-    unet.load_model("/home/andrey/Documents/comp3710/project/model.pt")
-else:
-    unet.train_model()
-    unet.test_model()
-    unet.save_model("/home/andrey/Documents/comp3710/project/model.pt")
-model = unet.use()
+unet = BasicUnet(data, True)
+unet.train_model()
+model = unet.model
 for masks, images in dl:
     mask = masks
     inp = images
@@ -33,13 +29,9 @@ for masks, images in dl:
     print(out)
     break
 
-improved_unet = ImprovedUnet(dev, data, True)
-if load:
-    improved_unet.load_model("/home/andrey/Documents/comp3710/project/comparison_model.pt")
-else:
-    improved_unet.train_model()
-    improved_unet.save_model("/home/andrey/Documents/comp3710/project/comparison_model.pt")
-model = improved_unet.use()
+improved_unet = ImprovedUnet(data, True)
+improved_unet.train_model()
+model = improved_unet.model
 for masks, images in dl: 
     mask = masks
     inp = images
